@@ -110,6 +110,10 @@ impl VtxoInput {
     pub fn outpoint(&self) -> OutPoint {
         self.outpoint
     }
+
+    pub fn is_recoverable(&self) -> bool {
+        self.is_recoverable
+    }
 }
 
 /// A nonce key pair per tree transaction output that we are a part of in the batch.
