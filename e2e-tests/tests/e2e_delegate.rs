@@ -54,9 +54,8 @@ pub async fn e2e_delegate() {
     assert_eq!(alice_offchain_balance.confirmed(), alice_fund_amount);
     assert_eq!(alice_offchain_balance.pending(), Amount::ZERO);
 
-    // Wait a bit longer to ensure the blockchain has fully updated and marked the boarding
-    // output as spent
-    tracing::info!("Waiting for blockchain state to settle...");
+    // Wait for the server's timelock before the VTXO can be used for intent registration
+    tracing::info!("Waiting for VTXO timelock (3 seconds)...");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     tracing::info!("Step 3: Alice generates a delegate for Bob");

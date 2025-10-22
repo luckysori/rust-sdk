@@ -8,7 +8,6 @@ use crate::Blockchain;
 use crate::Client;
 use crate::Error;
 use crate::ExplorerUtxo;
-use ark_core::anchor_output;
 use ark_core::batch;
 use ark_core::batch::aggregate_nonces;
 use ark_core::batch::create_and_sign_forfeit_txs;
@@ -26,26 +25,16 @@ use ark_core::ErrorContext as _;
 use ark_core::TxGraph;
 use backon::ExponentialBuilder;
 use backon::Retryable;
-use bitcoin::absolute::LockTime;
 use bitcoin::hashes::sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
 use bitcoin::key::Keypair;
-use bitcoin::key::Secp256k1;
-use bitcoin::psbt::PsbtSighashType;
 use bitcoin::secp256k1;
 use bitcoin::secp256k1::schnorr;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::sighash::Prevouts;
-use bitcoin::sighash::SighashCache;
-use bitcoin::taproot;
-use bitcoin::transaction;
 use bitcoin::Address;
 use bitcoin::Amount;
 use bitcoin::Psbt;
-use bitcoin::TapLeafHash;
-use bitcoin::TapSighashType;
-use bitcoin::Transaction;
 use bitcoin::TxIn;
 use bitcoin::TxOut;
 use bitcoin::Txid;
@@ -54,7 +43,6 @@ use futures::StreamExt;
 use jiff::Timestamp;
 use rand::CryptoRng;
 use rand::Rng;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 impl<B, W, S> Client<B, W, S>
@@ -230,51 +218,22 @@ where
 
         let server_info = &self.server_info;
 
-        let inputs = {
-            let boarding_inputs = onchain_inputs.clone().into_iter().map(|o| {
-                intent::Input::new(
-                    o.outpoint(),
-                    o.boarding_output().exit_delay(),
-                    TxOut {
-                        value: o.amount(),
-                        script_pubkey: o.boarding_output().script_pubkey(),
-                    },
-                    o.boarding_output().tapscripts(),
-                    o.boarding_output().owner_pk(),
-                    o.boarding_output().forfeit_spend_info(),
-                    true,
-                )
-            });
-
-            let vtxo_inputs = vtxo_inputs
-                .clone()
-                .into_iter()
-                .map(|v| {
-                    Ok(intent::Input::new(
-                        v.outpoint(),
-                        v.vtxo().exit_delay(),
-                        TxOut {
-                            value: v.amount(),
-                            script_pubkey: v.vtxo().script_pubkey(),
-                        },
-                        v.vtxo().tapscripts(),
-                        v.vtxo().owner_pk(),
-                        v.vtxo()
-                            .forfeit_spend_info()
-                            .context("failed to get exit spend info")?,
-                        false,
-                    ))
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-
-            boarding_inputs.chain(vtxo_inputs).collect::<Vec<_>>()
-        };
-
         let outputs = vec![intent::Output::Offchain(TxOut {
             value: total_amount,
             script_pubkey: to_address.to_p2tr_script_pubkey(),
         })];
 
+        // Step 1: Prepare unsigned PSBTs using ark-core
+        let mut delegation_psbts = batch::prepare_delegation_psbts(
+            vtxo_inputs.clone(),
+            onchain_inputs.clone(),
+            outputs.clone(),
+            vec![delegate_cosigner_pk],
+            &server_info.forfeit_address,
+            server_info.dust,
+        )?;
+
+        // Step 2: Sign the PSBTs using ark-core
         let sign_for_onchain_pk_fn = |pk: &XOnlyPublicKey,
                                       msg: &secp256k1::Message|
          -> Result<schnorr::Signature, ark_core::Error> {
@@ -284,29 +243,17 @@ where
                 .map_err(|e| ark_core::Error::ad_hoc(e.to_string()))
         };
 
-        // Create and sign the intent using the owner's key
-        let intent = intent::make_intent(
-            &[*self.kp()],
-            sign_for_onchain_pk_fn,
-            inputs,
-            outputs.clone(),
-            vec![delegate_cosigner_pk],
-        )?;
+        batch::sign_delegation_psbts(&mut delegation_psbts, &[*self.kp()], sign_for_onchain_pk_fn)?;
 
-        // Create partial forfeit transactions with SIGHASH_ALL | ANYONECANPAY
-        let partial_forfeit_txs = if !vtxo_inputs.is_empty() {
-            self.create_partial_forfeit_txs(
-                &vtxo_inputs,
-                &server_info.forfeit_address,
-                server_info.dust,
-            )?
-        } else {
-            Vec::new()
-        };
+        // Create Intent from the signed delegation PSBTs
+        let intent = intent::Intent::new(
+            delegation_psbts.intent_psbt,
+            delegation_psbts.intent_message,
+        );
 
         Ok(Delegate {
             intent,
-            partial_forfeit_txs,
+            partial_forfeit_txs: delegation_psbts.forfeit_psbts,
             vtxo_inputs,
             onchain_inputs,
             outputs,
@@ -863,116 +810,6 @@ where
         }
 
         Ok(completed_forfeit_psbts)
-    }
-
-    /// Create partial forfeit transactions signed with SIGHASH_ALL | ANYONECANPAY.
-    ///
-    /// These transactions can later be completed by the delegate by adding the connector input.
-    fn create_partial_forfeit_txs(
-        &self,
-        vtxo_inputs: &[batch::VtxoInput],
-        server_forfeit_address: &Address,
-        dust: Amount,
-    ) -> Result<Vec<Psbt>, Error> {
-        const FORFEIT_TX_VTXO_INDEX: usize = 0;
-
-        let secp = Secp256k1::new();
-
-        let mut partial_forfeit_psbts = Vec::new();
-
-        for vtxo_input in vtxo_inputs.iter() {
-            if vtxo_input.is_recoverable() {
-                // Recoverable VTXOs don't need to be forfeited.
-                continue;
-            }
-
-            let vtxo = vtxo_input.vtxo();
-            let vtxo_amount = vtxo_input.amount();
-            let virtual_tx_outpoint = vtxo_input.outpoint();
-
-            let connector_amount = dust;
-
-            // Create a partial forfeit transaction with only the VTXO input
-            // The connector will be added later by the delegate
-            let forfeit_output = TxOut {
-                value: vtxo_amount + connector_amount,
-                script_pubkey: server_forfeit_address.script_pubkey(),
-            };
-
-            let mut forfeit_psbt = Psbt::from_unsigned_tx(Transaction {
-                version: transaction::Version::non_standard(3),
-                lock_time: LockTime::ZERO,
-                input: vec![TxIn {
-                    previous_output: virtual_tx_outpoint,
-                    ..Default::default()
-                }],
-                output: vec![forfeit_output.clone(), anchor_output()],
-            })
-            .map_err(|e| Error::ad_hoc(format!("failed to create partial forfeit PSBT: {e}")))?;
-
-            forfeit_psbt.inputs[FORFEIT_TX_VTXO_INDEX].witness_utxo = Some(TxOut {
-                value: vtxo_amount,
-                script_pubkey: vtxo.script_pubkey(),
-            });
-
-            // Set sighash type to SIGHASH_ALL | ANYONECANPAY
-            forfeit_psbt.inputs[FORFEIT_TX_VTXO_INDEX].sighash_type =
-                Some(PsbtSighashType::from(TapSighashType::AllPlusAnyoneCanPay));
-
-            let (forfeit_script, forfeit_control_block) = vtxo.forfeit_spend_info()?;
-
-            let leaf_version = forfeit_control_block.leaf_version;
-            forfeit_psbt.inputs[FORFEIT_TX_VTXO_INDEX].tap_scripts = BTreeMap::from_iter([(
-                forfeit_control_block,
-                (forfeit_script.clone(), leaf_version),
-            )]);
-
-            // Sign with SIGHASH_ALL | ANYONECANPAY
-            let prevouts = forfeit_psbt
-                .inputs
-                .iter()
-                .filter_map(|i| i.witness_utxo.clone())
-                .collect::<Vec<_>>();
-            let prevouts = Prevouts::All(&prevouts);
-
-            let leaf_hash = TapLeafHash::from_script(&forfeit_script, leaf_version);
-
-            let tap_sighash = SighashCache::new(&forfeit_psbt.unsigned_tx)
-                .taproot_script_spend_signature_hash(
-                    FORFEIT_TX_VTXO_INDEX,
-                    &prevouts,
-                    leaf_hash,
-                    TapSighashType::AllPlusAnyoneCanPay,
-                )
-                .map_err(|e| {
-                    Error::ad_hoc(format!(
-                        "failed to compute sighash for partial forfeit: {e}"
-                    ))
-                })?;
-
-            let msg = secp256k1::Message::from_digest(tap_sighash.to_raw_hash().to_byte_array());
-
-            let sig = secp.sign_schnorr_no_aux_rand(&msg, self.kp());
-            let pk = self.kp().x_only_public_key().0;
-
-            secp.verify_schnorr(&sig, &msg, &pk).map_err(|e| {
-                Error::ad_hoc(format!(
-                    "failed to verify own partial forfeit signature: {e}"
-                ))
-            })?;
-
-            let sig = taproot::Signature {
-                signature: sig,
-                sighash_type: TapSighashType::AllPlusAnyoneCanPay,
-            };
-
-            forfeit_psbt.inputs[FORFEIT_TX_VTXO_INDEX].tap_script_sigs =
-                BTreeMap::from_iter([((pk, leaf_hash), sig)]);
-
-            partial_forfeit_psbts.push(forfeit_psbt);
-        }
-
-        Ok(partial_forfeit_psbts)
     }
 
     /// Get all the [`batch::OnChainInput`]s and [`batch::VtxoInput`]s that can be used to join an
