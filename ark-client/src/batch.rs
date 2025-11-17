@@ -734,6 +734,311 @@ where
         }
     }
 
+    /// Prepare a shared delegation for multi-party signed VTXOs.
+    ///
+    /// This method creates unsigned PSBTs that multiple parties can sign in sequence before
+    /// one party (the settler) performs the settlement protocol.
+    ///
+    /// # Arguments
+    ///
+    /// * `vtxo_inputs` - The shared VTXOs to delegate (may have multiple owners)
+    /// * `outputs` - The settlement outputs (flexible - can go to any party)
+    /// * `settler_cosigner_pk` - The cosigner public key of the party who will settle
+    ///
+    /// # Returns
+    ///
+    /// An unsigned `SharedDelegate` that can be signed by each party using
+    /// `sign_shared_delegation_psbts`
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Alice prepares unsigned PSBTs
+    /// let shared_delegate = alice.prepare_shared_delegation(
+    ///     vtxo_inputs,
+    ///     outputs,
+    ///     alice_cosigner_pk
+    /// ).await?;
+    /// ```
+    pub async fn prepare_shared_delegation(
+        &self,
+        vtxo_inputs: Vec<batch::VtxoInput>,
+        outputs: Vec<intent::Output>,
+        settler_cosigner_pk: PublicKey,
+    ) -> Result<SharedDelegate, Error> {
+        if vtxo_inputs.is_empty() {
+            return Err(Error::ad_hoc("no inputs to delegate"));
+        }
+
+        let server_info = &self.server_info;
+
+        // Prepare unsigned PSBTs using ark-core
+        let delegation_psbts = batch::prepare_shared_delegation_psbts(
+            vtxo_inputs,
+            outputs,
+            settler_cosigner_pk,
+            &server_info.forfeit_address,
+            server_info.dust,
+        )?;
+
+        Ok(SharedDelegate {
+            delegation_psbts,
+            settler_cosigner_pk,
+        })
+    }
+
+    /// Sign shared delegation PSBTs with the client's keypair.
+    ///
+    /// This method can be called by each party to add their signatures to the delegation PSBTs.
+    /// It's safe to call multiple times - it will skip inputs that are already signed.
+    ///
+    /// # Arguments
+    ///
+    /// * `shared_delegate` - The shared delegation containing PSBTs to sign
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Bob signs the PSBTs
+    /// bob.sign_shared_delegation_psbts(&mut shared_delegate)?;
+    ///
+    /// // Later, Alice signs the same PSBTs (accumulative)
+    /// alice.sign_shared_delegation_psbts(&mut shared_delegate)?;
+    /// ```
+    pub fn sign_shared_delegation_psbts(
+        &self,
+        shared_delegate: &mut SharedDelegate,
+    ) -> Result<(), Error> {
+        let sign_for_onchain_pk_fn = |pk: &XOnlyPublicKey,
+                                      msg: &secp256k1::Message|
+         -> Result<schnorr::Signature, ark_core::Error> {
+            self.inner
+                .wallet
+                .sign_for_pk(pk, msg)
+                .map_err(|e| ark_core::Error::ad_hoc(e.to_string()))
+        };
+
+        batch::sign_shared_delegation_psbts(
+            &mut shared_delegate.delegation_psbts,
+            &[*self.kp()],
+            sign_for_onchain_pk_fn,
+        )?;
+
+        Ok(())
+    }
+
+    /// Settle a shared delegation by performing the batch protocol with fully-signed PSBTs.
+    ///
+    /// This method allows the settler (e.g., Alice) to complete the settlement using PSBTs
+    /// that have been signed by all parties. The settler signs the tree transactions during
+    /// the batch protocol.
+    ///
+    /// # Arguments
+    ///
+    /// * `rng` - Random number generator for nonce generation
+    /// * `shared_delegate` - The shared delegation with fully-signed PSBTs
+    /// * `settler_cosigner_kp` - The settler's cosigner keypair for tree signing
+    ///
+    /// # Returns
+    ///
+    /// The commitment transaction ID if successful.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Alice settles the shared delegation
+    /// let txid = alice.settle_shared_delegation(
+    ///     &mut rng,
+    ///     shared_delegate,
+    ///     alice_cosigner_kp
+    /// ).await?;
+    /// ```
+    pub async fn settle_shared_delegation<R>(
+        &self,
+        rng: &mut R,
+        shared_delegate: SharedDelegate,
+        settler_cosigner_kp: Keypair,
+    ) -> Result<Txid, Error>
+    where
+        R: Rng + CryptoRng,
+    {
+        // Verify the cosigner key matches
+        if settler_cosigner_kp.public_key() != shared_delegate.settler_cosigner_pk {
+            return Err(Error::ad_hoc(
+                "provided settler cosigner keypair does not match settler_cosigner_pk",
+            ));
+        }
+
+        let delegation_psbts = shared_delegate.delegation_psbts;
+
+        // Create Intent from the fully-signed PSBTs
+        let intent = intent::Intent::new(
+            delegation_psbts.intent_psbt,
+            delegation_psbts.intent_message,
+        );
+
+        // Register intent with server
+        let intent_id = self
+            .inner
+            .grpc
+            .register_intent_with_proof(
+                intent.serialize_proof(),
+                intent
+                    .serialize_message()
+                    .map_err(|e| Error::ad_hoc(e.to_string()))?,
+            )
+            .await?;
+
+        tracing::debug!("Registered delegated intent intent_id={intent_id}");
+
+        let vtxo_inputs = delegation_psbts.vtxo_inputs.clone();
+        let partial_forfeit_txs = delegation_psbts.forfeit_psbts.clone();
+
+        // Subscribe to batch events
+        let mut stream = self.inner.grpc.subscribe_batch_events().await?;
+
+        while let Some(event_result) = stream.next().await {
+            match event_result {
+                Ok(event) => match event {
+                    StreamEvent::BatchStarted(batch_id) => {
+                        tracing::info!(batch_id, "Batch signing started");
+
+                        // Check if our intent is in this batch
+                        let intents = self.inner.grpc.list_batch_intents(&batch_id).await?;
+
+                        if !intents.iter().any(|id| id == &intent_id) {
+                            tracing::debug!("Intent not in this batch");
+                            continue;
+                        }
+
+                        tracing::info!(batch_id, "Our intent is in this batch");
+                    }
+                    StreamEvent::TreeSigningStarted(batch_id, vtxos_graph) => {
+                        tracing::debug!(batch_id, "Tree signing started");
+
+                        // Generate nonces for tree transactions
+                        let nonce_kps = batch::generate_nonce_tree(
+                            &vtxos_graph.tree,
+                            &vtxos_graph.all_tree_txs,
+                        )?;
+
+                        let nonce_points = batch::aggregate_nonces(&nonce_kps, &vtxos_graph.tree)?;
+
+                        tracing::info!(
+                            cosigner_pk = %settler_cosigner_kp.public_key(),
+                            "Submitting nonce tree for cosigner PK"
+                        );
+
+                        // Submit settler's nonce tree
+                        self.inner
+                            .grpc
+                            .submit_nonce_tree(
+                                &batch_id,
+                                settler_cosigner_kp.public_key(),
+                                nonce_points,
+                            )
+                            .await?;
+                    }
+                    StreamEvent::TreeNonces(
+                        batch_id,
+                        txid,
+                        _cosigner_pk,
+                        _public_nonces,
+                        partial_sig_trees,
+                    ) => {
+                        tracing::debug!(
+                            batch_id,
+                            txid = %txid,
+                            "Received TreeNonces event"
+                        );
+
+                        // Find our nonce tree from previous step
+                        let nonce_kps = batch::generate_nonce_tree(
+                            &partial_sig_trees.tree,
+                            &partial_sig_trees.all_tree_txs,
+                        )?;
+
+                        // Sign tree transactions with settler's cosigner keypair
+                        let partial_sigs = batch::sign_batch_tree_tx(
+                            &partial_sig_trees.tree,
+                            &partial_sig_trees.all_tree_txs,
+                            &nonce_kps,
+                            settler_cosigner_kp,
+                            &partial_sig_trees.public_nonces,
+                        )?;
+
+                        tracing::debug!("Signed tree transactions");
+
+                        // Submit settler's signatures
+                        self.inner
+                            .grpc
+                            .submit_partial_sigs(
+                                &batch_id,
+                                settler_cosigner_kp.public_key(),
+                                partial_sigs,
+                            )
+                            .await?;
+                    }
+                    StreamEvent::BatchFinalization(batch_id, commitment_tx, connectors_graph) => {
+                        tracing::debug!(
+                            batch_id,
+                            commitment_txid = %commitment_tx.compute_txid(),
+                            "Batch finalization started (delegate)"
+                        );
+
+                        // Complete forfeit transactions by adding connectors
+                        let completed_forfeit_txs = self.complete_delegated_forfeit_txs(
+                            &partial_forfeit_txs,
+                            &vtxo_inputs,
+                            &connectors_graph.all_connector_leaves,
+                            self.server_info.dust,
+                        )?;
+
+                        tracing::debug!(
+                            "Completing delegated forfeit transactions batch_id={batch_id}"
+                        );
+
+                        // Submit completed forfeit transactions
+                        self.inner
+                            .grpc
+                            .submit_signed_forfeit_txs(&batch_id, completed_forfeit_txs)
+                            .await?;
+                    }
+                    StreamEvent::BatchFinalized(batch_id, commitment_txid) => {
+                        tracing::info!(
+                            batch_id,
+                            commitment_txid = %commitment_txid,
+                            "Delegated batch finalized"
+                        );
+
+                        return Ok(commitment_txid);
+                    }
+                    StreamEvent::BatchFailed(e) => {
+                        if e.id == intent_id {
+                            return Err(Error::ad_hoc(format!(
+                                "batch failed {}: {}",
+                                e.id, e.reason
+                            )));
+                        }
+
+                        tracing::debug!("Unrelated batch failed: {e:?}");
+                    }
+                    StreamEvent::Heartbeat => {}
+                },
+                Some(Err(e)) => {
+                    tracing::error!("Got error from event stream");
+
+                    return Err(Error::ark_server(e));
+                }
+                None => {
+                    return Err(Error::ark_server("dropped batch event stream"));
+                }
+            }
+        }
+
+        Err(Error::ad_hoc("batch event stream ended unexpectedly"))
+    }
+
     /// Complete the delegated forfeit transactions by adding connector inputs and finalizing them.
     fn complete_delegated_forfeit_txs(
         &self,
@@ -1557,4 +1862,23 @@ pub struct Delegate {
     pub outputs: Vec<intent::Output>,
     /// The cosigner public key to be used by the delegate.
     pub delegate_cosigner_pk: PublicKey,
+}
+
+/// Represents a shared VTXO delegation prepared for multi-party signing.
+///
+/// This struct contains all the PSBTs and metadata needed for shared VTXO delegation,
+/// where multiple parties (e.g., Alice and Bob) jointly own VTXOs and need to both sign
+/// before one party (the settler) performs the settlement protocol.
+///
+/// # Protocol Flow
+///
+/// 1. Alice prepares unsigned PSBTs using `prepare_shared_delegation()`
+/// 2. Bob signs the PSBTs using `sign_shared_delegation_psbts()`
+/// 3. Alice adds her signatures using `sign_shared_delegation_psbts()`
+/// 4. Alice settles using `settle_shared_delegation()`
+pub struct SharedDelegate {
+    /// The delegation PSBTs (may be unsigned, partially signed, or fully signed).
+    pub delegation_psbts: batch::DelegationPsbts,
+    /// The cosigner public key of the party who will perform settlement (tree signing).
+    pub settler_cosigner_pk: PublicKey,
 }
