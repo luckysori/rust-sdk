@@ -734,6 +734,41 @@ where
         }
     }
 
+    /// Automatically prepare shared delegation by fetching all available inputs.
+    ///
+    /// This is a convenience method that automatically fetches all available VTXO inputs
+    /// and creates a delegation that sends everything to the client's own address.
+    /// For more control over inputs and outputs, use `prepare_shared_delegation`.
+    ///
+    /// # Arguments
+    ///
+    /// * `settler_cosigner_pk` - The public key of the party who will perform settlement
+    /// * `select_recoverable_vtxos` - Whether to include recoverable VTXOs
+    pub async fn prepare_shared_delegation_auto(
+        &self,
+        settler_cosigner_pk: PublicKey,
+        select_recoverable_vtxos: bool,
+    ) -> Result<SharedDelegate, Error> {
+        // Get off-chain address and send all funds to this address
+        let (to_address, _) = self.get_offchain_address()?;
+
+        let (_, vtxo_inputs, total_amount) = self
+            .fetch_commitment_transaction_inputs(select_recoverable_vtxos)
+            .await?;
+
+        if vtxo_inputs.is_empty() {
+            return Err(Error::ad_hoc("no inputs to delegate"));
+        }
+
+        let outputs = vec![intent::Output::Offchain(TxOut {
+            value: total_amount,
+            script_pubkey: to_address.to_p2tr_script_pubkey(),
+        })];
+
+        self.prepare_shared_delegation(vtxo_inputs, outputs, settler_cosigner_pk)
+            .await
+    }
+
     /// Prepare a shared delegation for multi-party signed VTXOs.
     ///
     /// This method creates unsigned PSBTs that multiple parties can sign in sequence before
@@ -809,20 +844,7 @@ where
         &self,
         shared_delegate: &mut SharedDelegate,
     ) -> Result<(), Error> {
-        let sign_for_onchain_pk_fn = |pk: &XOnlyPublicKey,
-                                      msg: &secp256k1::Message|
-         -> Result<schnorr::Signature, ark_core::Error> {
-            self.inner
-                .wallet
-                .sign_for_pk(pk, msg)
-                .map_err(|e| ark_core::Error::ad_hoc(e.to_string()))
-        };
-
-        batch::sign_shared_delegation_psbts(
-            &mut shared_delegate.delegation_psbts,
-            &[*self.kp()],
-            sign_for_onchain_pk_fn,
-        )?;
+        batch::sign_shared_delegation_psbts(&mut shared_delegate.delegation_psbts, &[*self.kp()])?;
 
         Ok(())
     }
@@ -870,6 +892,8 @@ where
         }
 
         let delegation_psbts = shared_delegate.delegation_psbts;
+        let server_info = &self.server_info;
+        let (ark_forfeit_pk, _) = server_info.forfeit_pk.x_only_public_key();
 
         // Create Intent from the fully-signed PSBTs
         let intent = intent::Intent::new(
@@ -878,156 +902,354 @@ where
         );
 
         // Register intent with server
-        let intent_id = self
-            .inner
-            .grpc
-            .register_intent_with_proof(
-                intent.serialize_proof(),
-                intent
-                    .serialize_message()
-                    .map_err(|e| Error::ad_hoc(e.to_string()))?,
-            )
-            .await?;
+        let network_client = self.network_client();
+        let intent_id = timeout_op(self.inner.timeout, network_client.register_intent(intent))
+            .await
+            .context("failed to register shared delegation intent")??;
 
-        tracing::debug!("Registered delegated intent intent_id={intent_id}");
+        tracing::debug!("Registered shared delegation intent intent_id={intent_id}");
 
         let vtxo_inputs = delegation_psbts.vtxo_inputs.clone();
         let partial_forfeit_txs = delegation_psbts.forfeit_psbts.clone();
 
-        // Subscribe to batch events
-        let mut stream = self.inner.grpc.subscribe_batch_events().await?;
+        #[derive(Debug, PartialEq)]
+        enum Step {
+            Start,
+            BatchStarted,
+            BatchSigningStarted,
+            Finalized,
+        }
 
-        while let Some(event_result) = stream.next().await {
-            match event_result {
-                Ok(event) => match event {
-                    StreamEvent::BatchStarted(batch_id) => {
-                        tracing::info!(batch_id, "Batch signing started");
+        impl Step {
+            fn next(&self) -> Step {
+                match self {
+                    Step::Start => Step::BatchStarted,
+                    Step::BatchStarted => Step::BatchSigningStarted,
+                    Step::BatchSigningStarted => Step::Finalized,
+                    Step::Finalized => Step::Finalized,
+                }
+            }
+        }
 
-                        // Check if our intent is in this batch
-                        let intents = self.inner.grpc.list_batch_intents(&batch_id).await?;
+        let mut step = Step::Start;
 
-                        if !intents.iter().any(|id| id == &intent_id) {
-                            tracing::debug!("Intent not in this batch");
+        let settler_cosigner_kps = [settler_cosigner_kp];
+        let settler_cosigner_pks = settler_cosigner_kps
+            .iter()
+            .map(|k| k.public_key())
+            .collect::<Vec<_>>();
+
+        let mut batch_id: Option<String> = None;
+
+        let vtxo_input_outpoints = vtxo_inputs.iter().map(|i| i.outpoint()).collect::<Vec<_>>();
+
+        let topics = vtxo_input_outpoints
+            .iter()
+            .map(ToString::to_string)
+            .chain(
+                settler_cosigner_pks
+                    .iter()
+                    .map(|pk| pk.serialize().to_lower_hex_string()),
+            )
+            .collect();
+
+        let mut stream = network_client.get_event_stream(topics).await?;
+
+        let mut unsigned_commitment_tx = None;
+        let mut vtxo_graph_chunks = Some(Vec::new());
+        let mut vtxo_graph: Option<TxGraph> = None;
+        let mut connectors_graph_chunks = Some(Vec::new());
+        let mut batch_expiry = None;
+        let mut agg_nonce_pks = HashMap::new();
+        let mut our_nonce_trees: Option<HashMap<Keypair, NonceKps>> = None;
+
+        loop {
+            match stream.next().await {
+                Some(Ok(event)) => match event {
+                    StreamEvent::BatchStarted(e) => {
+                        if step != Step::Start {
                             continue;
                         }
 
-                        tracing::info!(batch_id, "Our intent is in this batch");
+                        let hash = sha256::Hash::hash(intent_id.as_bytes());
+                        let hash = hash.as_byte_array().to_vec().to_lower_hex_string();
+
+                        if e.intent_id_hashes.iter().any(|h| h == &hash) {
+                            timeout_op(
+                                self.inner.timeout,
+                                network_client.confirm_registration(intent_id.clone()),
+                            )
+                            .await
+                            .context("failed to confirm intent registration")??;
+
+                            tracing::info!(batch_id = e.id, intent_id, "Intent ID found for batch");
+
+                            batch_id = Some(e.id);
+                            batch_expiry = Some(e.batch_expiry);
+                            step = step.next();
+                        } else {
+                            tracing::debug!(
+                                batch_id = e.id,
+                                intent_id,
+                                "Intent ID not found for batch"
+                            );
+                        }
                     }
-                    StreamEvent::TreeSigningStarted(batch_id, vtxos_graph) => {
-                        tracing::debug!(batch_id, "Tree signing started");
+                    StreamEvent::TreeTx(e) => {
+                        if step != Step::BatchStarted && step != Step::BatchSigningStarted {
+                            continue;
+                        }
 
-                        // Generate nonces for tree transactions
-                        let nonce_kps = batch::generate_nonce_tree(
-                            &vtxos_graph.tree,
-                            &vtxos_graph.all_tree_txs,
-                        )?;
+                        match e.batch_tree_event_type {
+                            BatchTreeEventType::Vtxo => {
+                                if let Some(ref mut chunks) = vtxo_graph_chunks {
+                                    tracing::debug!("Got new VTXO graph chunk");
+                                    chunks.push(e.tx_graph_chunk)
+                                }
+                            }
+                            BatchTreeEventType::Connector => {
+                                if let Some(ref mut chunks) = connectors_graph_chunks {
+                                    tracing::debug!("Got new connectors graph chunk");
+                                    chunks.push(e.tx_graph_chunk)
+                                }
+                            }
+                        }
+                    }
+                    StreamEvent::TreeSigningStarted(e) => {
+                        if step != Step::BatchStarted {
+                            continue;
+                        }
 
-                        let nonce_points = batch::aggregate_nonces(&nonce_kps, &vtxos_graph.tree)?;
-
-                        tracing::info!(
-                            cosigner_pk = %settler_cosigner_kp.public_key(),
-                            "Submitting nonce tree for cosigner PK"
+                        let chunks = vtxo_graph_chunks.take().ok_or(Error::ark_server(
+                            "received tree signing started event without VTXO graph chunks",
+                        ))?;
+                        vtxo_graph = Some(
+                            TxGraph::new(chunks)
+                                .map_err(Error::from)
+                                .context("failed to build VTXO graph before generating nonces")?,
                         );
 
-                        // Submit settler's nonce tree
-                        self.inner
-                            .grpc
-                            .submit_nonce_tree(
-                                &batch_id,
-                                settler_cosigner_kp.public_key(),
-                                nonce_points,
+                        tracing::info!(batch_id = e.id, "Batch signing started");
+
+                        // Verify settler's cosigner key is in the batch
+                        for settler_pk in settler_cosigner_pks.iter() {
+                            if !e.cosigners_pubkeys.iter().any(|p| p == settler_pk) {
+                                return Err(Error::ark_server(format!(
+                                    "settler cosigner PK not present in cosigner PKs: {settler_pk}"
+                                )));
+                            }
+                        }
+
+                        let mut our_nonce_tree_map = HashMap::new();
+                        for settler_kp in settler_cosigner_kps.iter() {
+                            let settler_pk = settler_kp.public_key();
+                            let nonce_tree = batch::generate_nonce_tree(
+                                rng,
+                                vtxo_graph.as_ref().expect("VTXO graph"),
+                                settler_pk,
+                                &e.unsigned_commitment_tx,
                             )
-                            .await?;
+                            .map_err(Error::from)
+                            .context("failed to generate VTXO nonce tree")?;
+
+                            tracing::info!(
+                                cosigner_pk = %settler_pk,
+                                "Submitting nonce tree for settler cosigner PK"
+                            );
+
+                            network_client
+                                .submit_tree_nonces(&e.id, settler_pk, nonce_tree.to_nonce_pks())
+                                .await
+                                .map_err(Error::ark_server)
+                                .context("failed to submit VTXO nonce tree")?;
+
+                            our_nonce_tree_map.insert(*settler_kp, nonce_tree);
+                        }
+
+                        unsigned_commitment_tx = Some(e.unsigned_commitment_tx);
+                        our_nonce_trees = Some(our_nonce_tree_map);
+                        step = step.next();
                     }
-                    StreamEvent::TreeNonces(
-                        batch_id,
-                        txid,
-                        _cosigner_pk,
-                        _public_nonces,
-                        partial_sig_trees,
-                    ) => {
+                    StreamEvent::TreeNonces(e) => {
+                        if step != Step::BatchSigningStarted {
+                            continue;
+                        }
+
+                        let tree_tx_nonce_pks = e.nonces;
+
+                        let cosigner_pk = match tree_tx_nonce_pks.0.iter().find(|(pk, _)| {
+                            settler_cosigner_pks
+                                .iter()
+                                .any(|p| &&p.x_only_public_key().0 == pk)
+                        }) {
+                            Some((pk, _)) => *pk,
+                            None => {
+                                tracing::debug!(
+                                    batch_id = e.id,
+                                    txid = %e.txid,
+                                    "Received irrelevant TreeNonces event"
+                                );
+                                continue;
+                            }
+                        };
+
                         tracing::debug!(
-                            batch_id,
-                            txid = %txid,
+                            batch_id = e.id,
+                            txid = %e.txid,
+                            %cosigner_pk,
                             "Received TreeNonces event"
                         );
 
-                        // Find our nonce tree from previous step
-                        let nonce_kps = batch::generate_nonce_tree(
-                            &partial_sig_trees.tree,
-                            &partial_sig_trees.all_tree_txs,
-                        )?;
+                        let agg_nonce_pk = aggregate_nonces(tree_tx_nonce_pks);
+                        agg_nonce_pks.insert(e.txid, agg_nonce_pk);
 
-                        // Sign tree transactions with settler's cosigner keypair
-                        let partial_sigs = batch::sign_batch_tree_tx(
-                            &partial_sig_trees.tree,
-                            &partial_sig_trees.all_tree_txs,
-                            &nonce_kps,
-                            settler_cosigner_kp,
-                            &partial_sig_trees.public_nonces,
-                        )?;
+                        let vtxo_graph = match vtxo_graph {
+                            Some(ref vtxo_graph) => vtxo_graph,
+                            None => {
+                                let chunks = vtxo_graph_chunks.take().ok_or(Error::ark_server(
+                                    "received tree nonces event without VTXO graph chunks",
+                                ))?;
 
-                        tracing::debug!("Signed tree transactions");
+                                &TxGraph::new(chunks)
+                                    .map_err(Error::from)
+                                    .context("failed to build VTXO graph before tree signing")?
+                            }
+                        };
 
-                        // Submit settler's signatures
-                        self.inner
-                            .grpc
-                            .submit_partial_sigs(
-                                &batch_id,
-                                settler_cosigner_kp.public_key(),
-                                partial_sigs,
-                            )
-                            .await?;
+                        // Once we have all nonces, sign all tree transactions
+                        if agg_nonce_pks.len() == vtxo_graph.nb_of_nodes() {
+                            let settler_kp = settler_cosigner_kps
+                                .iter()
+                                .find(|kp| kp.public_key().x_only_public_key().0 == cosigner_pk)
+                                .ok_or_else(|| {
+                                    Error::ad_hoc("no settler cosigner keypair to sign for own PK")
+                                })?;
+
+                            let our_nonce_trees_map = our_nonce_trees.as_mut().ok_or(
+                                Error::ark_server("missing nonce trees during batch protocol"),
+                            )?;
+
+                            let our_nonce_tree = our_nonce_trees_map.get_mut(settler_kp).ok_or(
+                                Error::ark_server("missing nonce tree during batch protocol"),
+                            )?;
+
+                            let unsigned_commitment_tx = unsigned_commitment_tx
+                                .as_ref()
+                                .ok_or_else(|| Error::ad_hoc("missing commitment TX"))?;
+
+                            let batch_expiry = batch_expiry
+                                .ok_or_else(|| Error::ad_hoc("missing batch expiry"))?;
+
+                            let mut partial_sig_tree = PartialSigTree::default();
+                            for (txid, _) in vtxo_graph.as_map() {
+                                let agg_nonce_pk = agg_nonce_pks.get(&txid).ok_or_else(|| {
+                                    Error::ad_hoc(format!(
+                                        "missing aggregated nonce PK for TX {txid}"
+                                    ))
+                                })?;
+
+                                let sigs = sign_batch_tree_tx(
+                                    txid,
+                                    batch_expiry,
+                                    ark_forfeit_pk,
+                                    settler_kp,
+                                    *agg_nonce_pk,
+                                    vtxo_graph,
+                                    unsigned_commitment_tx,
+                                    our_nonce_tree,
+                                )
+                                .map_err(Error::from)
+                                .context("failed to sign VTXO tree")?;
+
+                                partial_sig_tree.0.extend(sigs.0);
+                            }
+
+                            network_client
+                                .submit_tree_signatures(
+                                    &e.id,
+                                    settler_kp.public_key(),
+                                    partial_sig_tree,
+                                )
+                                .await
+                                .map_err(Error::ark_server)
+                                .context("failed to submit VTXO tree signatures")?;
+                        }
                     }
-                    StreamEvent::BatchFinalization(batch_id, commitment_tx, connectors_graph) => {
+                    StreamEvent::BatchFinalization(e) => {
+                        if step != Step::BatchSigningStarted {
+                            continue;
+                        }
+
                         tracing::debug!(
-                            batch_id,
-                            commitment_txid = %commitment_tx.compute_txid(),
-                            "Batch finalization started (delegate)"
+                            batch_id = e.id,
+                            commitment_txid = %e.commitment_tx.unsigned_tx.compute_txid(),
+                            "Batch finalization started (shared delegation)"
                         );
+
+                        // Build connectors graph
+                        let connector_chunks =
+                            connectors_graph_chunks.take().ok_or(Error::ark_server(
+                                "received batch finalization without connector chunks",
+                            ))?;
+                        let connectors_graph = TxGraph::new(connector_chunks)
+                            .map_err(Error::from)
+                            .context("failed to build connectors graph")?;
 
                         // Complete forfeit transactions by adding connectors
                         let completed_forfeit_txs = self.complete_delegated_forfeit_txs(
                             &partial_forfeit_txs,
                             &vtxo_inputs,
-                            &connectors_graph.all_connector_leaves,
-                            self.server_info.dust,
+                            &connectors_graph.leaves(),
+                            server_info.dust,
                         )?;
 
                         tracing::debug!(
-                            "Completing delegated forfeit transactions batch_id={batch_id}"
+                            batch_id = e.id,
+                            "Completing shared delegation forfeit transactions"
                         );
 
                         // Submit completed forfeit transactions
-                        self.inner
-                            .grpc
-                            .submit_signed_forfeit_txs(&batch_id, completed_forfeit_txs)
-                            .await?;
-                    }
-                    StreamEvent::BatchFinalized(batch_id, commitment_txid) => {
-                        tracing::info!(
-                            batch_id,
-                            commitment_txid = %commitment_txid,
-                            "Delegated batch finalized"
-                        );
+                        timeout_op(
+                            self.inner.timeout,
+                            network_client.submit_signed_forfeit_txs(completed_forfeit_txs, None),
+                        )
+                        .await
+                        .map_err(Error::ark_server)
+                        .context("failed to submit signed forfeit TXs")??;
 
-                        return Ok(commitment_txid);
+                        step = step.next();
+                    }
+                    StreamEvent::BatchFinalized(e) => {
+                        if step == Step::Finalized {
+                            if let Some(ref batch_id) = batch_id {
+                                if &e.id == batch_id {
+                                    tracing::info!(
+                                        batch_id = e.id,
+                                        commitment_txid = %e.commitment_txid,
+                                        "Shared delegation batch finalized"
+                                    );
+
+                                    return Ok(e.commitment_txid);
+                                }
+                            }
+                        }
                     }
                     StreamEvent::BatchFailed(e) => {
-                        if e.id == intent_id {
-                            return Err(Error::ad_hoc(format!(
-                                "batch failed {}: {}",
-                                e.id, e.reason
-                            )));
+                        if let Some(ref batch_id) = batch_id {
+                            if &e.id == batch_id {
+                                return Err(Error::ad_hoc(format!(
+                                    "batch failed {}: {}",
+                                    e.id, e.reason
+                                )));
+                            }
                         }
 
                         tracing::debug!("Unrelated batch failed: {e:?}");
                     }
-                    StreamEvent::Heartbeat => {}
+                    _ => {}
                 },
                 Some(Err(e)) => {
                     tracing::error!("Got error from event stream");
-
                     return Err(Error::ark_server(e));
                 }
                 None => {
@@ -1035,8 +1257,6 @@ where
                 }
             }
         }
-
-        Err(Error::ad_hoc("batch event stream ended unexpectedly"))
     }
 
     /// Complete the delegated forfeit transactions by adding connector inputs and finalizing them.

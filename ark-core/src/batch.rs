@@ -1188,13 +1188,10 @@ where
 /// // Alice signs second (accumulates on top of Bob's signatures)
 /// sign_shared_delegation_psbts(&mut psbts, &[alice_kp], sign_fn)?;
 /// ```
-pub fn sign_shared_delegation_psbts<F>(
+pub fn sign_shared_delegation_psbts(
     delegation_psbts: &mut DelegationPsbts,
     signing_kps: &[Keypair],
-) -> Result<(), Error>
-where
-    F: Fn(&XOnlyPublicKey, &secp256k1::Message) -> Result<schnorr::Signature, Error>,
-{
+) -> Result<(), Error> {
     use crate::intent;
     use bitcoin::psbt;
 
