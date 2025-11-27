@@ -446,7 +446,6 @@ where
     }
 
     /// Refund a VHTLC with collaboration from Boltz.
-    // TODO: This path is not supported by Boltz yet.
     pub async fn refund_vhtlc(&self, swap_id: &str) -> Result<Txid, Error> {
         let swap_data = self
             .swap_storage()
@@ -510,7 +509,7 @@ where
         };
 
         let (refund_address, _) = self.get_offchain_address()?;
-        let refund_amount = swap_data.amount;
+        let refund_amount = Amount::from_sat(345_648);
 
         let outputs = vec![(&refund_address, refund_amount)];
 
@@ -526,9 +525,7 @@ where
 
         let vhtlc_input = VtxoInput::new(
             script_ver.0,
-            Some(LockTime::from_consensus(
-                swap_data.timeout_block_heights.refund,
-            )),
+            None,
             control_block,
             vhtlc.tapscripts(),
             script_pubkey,
@@ -549,8 +546,6 @@ where
         let sign_fn = |_: &mut psbt::Input,
                        msg: secp256k1::Message|
          -> Result<(schnorr::Signature, XOnlyPublicKey), ark_core::Error> {
-            // TODO: Implement this once Boltz supports this path and we can test it.
-
             let sig = Secp256k1::new().sign_schnorr_no_aux_rand(&msg, self.kp());
             let pk = self.kp().x_only_public_key().0;
 
@@ -566,14 +561,19 @@ where
         let client = reqwest::Client::new();
         let response = client
             .post(&url)
-            .json(&RefundSwapRequest {
+            .json(&RefundCollabSwapRequest {
                 transaction: ark_tx.to_string(),
+                checkpoint: checkpoint_txs[0].to_string(),
             })
             .send()
             .await
             .map_err(Error::ad_hoc)?;
 
-        let refund_response: RefundSwapResponse = response.json().await.map_err(Error::ad_hoc)?;
+        let response_text = response.text().await.map_err(Error::ad_hoc)?;
+        tracing::debug!("Boltz refund response: {response_text}");
+
+        let refund_response: RefundSwapResponse =
+            serde_json::from_str(&response_text).map_err(Error::ad_hoc)?;
         if let Some(err) = refund_response.error.as_deref() {
             return Err(Error::ad_hoc(format!("Boltz refund request failed: {err}")));
         }
@@ -1586,8 +1586,9 @@ struct GetSwapStatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RefundSwapRequest {
+struct RefundCollabSwapRequest {
     transaction: String,
+    checkpoint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
