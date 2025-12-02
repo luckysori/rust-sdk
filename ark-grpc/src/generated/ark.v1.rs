@@ -527,8 +527,16 @@ pub struct FinalizeTxRequest {
 pub struct FinalizeTxResponse {}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetPendingTxRequest {
-    #[prost(message, optional, tag = "1")]
-    pub intent: ::core::option::Option<Intent>,
+    #[prost(oneof = "get_pending_tx_request::Identifier", tags = "1")]
+    pub identifier: ::core::option::Option<get_pending_tx_request::Identifier>,
+}
+/// Nested message and enum types in `GetPendingTxRequest`.
+pub mod get_pending_tx_request {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Identifier {
+        #[prost(message, tag = "1")]
+        Intent(super::Intent),
+    }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetPendingTxResponse {

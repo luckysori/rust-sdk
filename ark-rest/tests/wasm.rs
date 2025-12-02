@@ -1,3 +1,5 @@
+#![cfg(target_arch = "wasm32")]
+
 use ark_core::Vtxo;
 use bitcoin::key::Secp256k1;
 use bitcoin::secp256k1::PublicKey;

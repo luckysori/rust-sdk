@@ -618,6 +618,14 @@ pub struct SubmitOffchainTxResponse {
     pub signed_checkpoint_txs: Vec<Psbt>,
 }
 
+/// A pending offchain transaction that was submitted but not yet finalized.
+#[derive(Debug, Clone)]
+pub struct PendingOffchainTx {
+    pub ark_txid: Txid,
+    pub signed_ark_tx: Psbt,
+    pub signed_checkpoint_txs: Vec<Psbt>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FinalizeOffchainTxResponse {}
 

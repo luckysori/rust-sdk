@@ -4,6 +4,7 @@ use crate::apis::ark_service_api::ark_service_confirm_registration;
 use crate::apis::ark_service_api::ark_service_delete_intent;
 use crate::apis::ark_service_api::ark_service_finalize_tx;
 use crate::apis::ark_service_api::ark_service_get_info;
+use crate::apis::ark_service_api::ark_service_get_pending_tx;
 use crate::apis::ark_service_api::ark_service_register_intent;
 use crate::apis::ark_service_api::ark_service_submit_signed_forfeit_txs;
 use crate::apis::ark_service_api::ark_service_submit_tree_nonces;
@@ -15,6 +16,7 @@ use crate::apis::indexer_service_api::indexer_service_subscribe_for_scripts;
 use crate::apis::indexer_service_api::indexer_service_unsubscribe_for_scripts;
 use crate::models;
 use crate::models::ConfirmRegistrationRequest;
+use crate::models::GetPendingTxRequest;
 use crate::models::Intent;
 use crate::models::SubmitSignedForfeitTxsRequest;
 use crate::models::SubmitTreeNoncesRequest;
@@ -30,6 +32,7 @@ use ark_core::server::IndexerPage;
 use ark_core::server::ListVtxo;
 use ark_core::server::NoncePks;
 use ark_core::server::PartialSigTree;
+use ark_core::server::PendingOffchainTx;
 use ark_core::server::StreamEvent;
 use ark_core::server::SubmitOffchainTxResponse;
 use ark_core::server::SubscriptionResponse;
@@ -145,6 +148,69 @@ impl Client {
         .map_err(Error::request)?;
 
         Ok(FinalizeOffchainTxResponse {})
+    }
+
+    /// Retrieve pending offchain transactions for the given intent.
+    pub async fn get_pending_tx(
+        &self,
+        intent: &ark_core::intent::GetPendingTxIntent,
+    ) -> Result<Vec<PendingOffchainTx>, Error> {
+        let message = intent.serialize_message().map_err(Error::conversion)?;
+        let proof = intent.serialize_proof();
+
+        let base64 = base64::engine::GeneralPurpose::new(
+            &base64::alphabet::STANDARD,
+            base64::engine::GeneralPurposeConfig::new(),
+        );
+
+        let res = ark_service_get_pending_tx(
+            &self.configuration,
+            GetPendingTxRequest {
+                intent: Some(Intent {
+                    proof: Some(proof),
+                    message: Some(message),
+                }),
+            },
+        )
+        .await
+        .map_err(Error::request)?;
+
+        let pending_txs = res
+            .pending_txs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tx| {
+                let ark_txid = tx
+                    .ark_txid
+                    .ok_or(Error::request("ark_txid not present"))?
+                    .parse()
+                    .map_err(Error::conversion)?;
+                let signed_ark_tx = tx
+                    .final_ark_tx
+                    .ok_or(Error::request("final_ark_tx not present"))?;
+                let signed_ark_tx = base64.decode(signed_ark_tx).map_err(Error::conversion)?;
+                let signed_ark_tx = Psbt::deserialize(&signed_ark_tx).map_err(Error::conversion)?;
+
+                let signed_checkpoint_txs = tx
+                    .signed_checkpoint_txs
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|tx| {
+                        let tx = base64.decode(tx).map_err(Error::conversion)?;
+                        let tx = Psbt::deserialize(&tx).map_err(Error::conversion)?;
+                        Ok(tx)
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+
+                Ok(PendingOffchainTx {
+                    ark_txid,
+                    signed_ark_tx,
+                    signed_checkpoint_txs,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(pending_txs)
     }
 
     pub async fn list_vtxos(&self, request: GetVtxosRequest) -> Result<ListVtxo, Error> {

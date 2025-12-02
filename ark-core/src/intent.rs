@@ -410,10 +410,268 @@ impl IntentMessage {
 }
 
 #[derive(Serialize, Debug, Clone)]
-#[serde(rename_all = "lowercase")]
 pub enum IntentMessageType {
+    #[serde(rename = "register")]
     Register,
+    #[serde(rename = "delete")]
     Delete,
+    #[serde(rename = "get-pending-tx")]
+    GetPendingTx,
+}
+
+/// Message for the get-pending-tx intent.
+///
+/// This is used to request pending offchain transactions for a set of VTXOs.
+#[derive(Serialize, Debug, Clone)]
+pub struct GetPendingTxMessage {
+    #[serde(rename = "type")]
+    message_type: IntentMessageType,
+    expire_at: u64,
+}
+
+impl GetPendingTxMessage {
+    pub fn new(expire_at: u64) -> Self {
+        Self {
+            message_type: IntentMessageType::GetPendingTx,
+            expire_at,
+        }
+    }
+
+    pub fn encode(&self) -> Result<String, Error> {
+        serde_json::to_string(self)
+            .map_err(Error::ad_hoc)
+            .context("failed to serialize get-pending-tx message to JSON")
+    }
+}
+
+/// Build an intent proof for retrieving pending offchain transactions.
+///
+/// This is used to prove ownership of the VTXOs for which we want to retrieve pending
+/// transactions.
+pub fn make_get_pending_tx_intent<SV, SO>(
+    sign_for_vtxo_fn: SV,
+    sign_for_onchain_fn: SO,
+    now_timestamp: u64,
+    inputs: Vec<Input>,
+) -> Result<GetPendingTxIntent, Error>
+where
+    SV: Fn(
+        &mut psbt::Input,
+        secp256k1::Message,
+    ) -> Result<(schnorr::Signature, XOnlyPublicKey), Error>,
+    SO: Fn(
+        &mut psbt::Input,
+        secp256k1::Message,
+    ) -> Result<(schnorr::Signature, XOnlyPublicKey), Error>,
+{
+    let expire_at = now_timestamp + (2 * 60);
+
+    let get_pending_tx_message = GetPendingTxMessage::new(expire_at);
+
+    let (mut proof_psbt, fake_input) =
+        build_get_pending_tx_proof_psbt(&get_pending_tx_message, &inputs)?;
+
+    for (i, proof_input) in proof_psbt.inputs.iter_mut().enumerate() {
+        if i == 0 {
+            let (script, control_block) = inputs[0].spend_info.clone();
+
+            proof_input
+                .tap_scripts
+                .insert(control_block, (script, taproot::LeafVersion::TapScript));
+        } else {
+            let (script, control_block) = inputs[i - 1].spend_info.clone();
+
+            let tap_tree = taptree::TapTree(inputs[i - 1].tapscripts.clone());
+            let bytes = tap_tree
+                .encode()
+                .map_err(Error::ad_hoc)
+                .with_context(|| format!("failed to encode taptree for input {i}"))?;
+
+            proof_input.unknown.insert(
+                psbt::raw::Key {
+                    type_value: 222,
+                    key: VTXO_TAPROOT_KEY.to_vec(),
+                },
+                bytes,
+            );
+            proof_input
+                .tap_scripts
+                .insert(control_block, (script, taproot::LeafVersion::TapScript));
+        };
+    }
+
+    let prevouts = proof_psbt
+        .inputs
+        .iter()
+        .filter_map(|i| i.witness_utxo.clone())
+        .collect::<Vec<_>>();
+
+    let inputs = [inputs, vec![fake_input]].concat();
+
+    for (i, proof_input) in proof_psbt.inputs.iter_mut().enumerate() {
+        let input = inputs
+            .iter()
+            .find(|input| input.outpoint == proof_psbt.unsigned_tx.input[i].previous_output)
+            .expect("witness utxo");
+
+        let prevouts = Prevouts::All(&prevouts);
+
+        let (_, (script, leaf_version)) =
+            proof_input.tap_scripts.first_key_value().expect("a value");
+
+        let leaf_hash = TapLeafHash::from_script(script, *leaf_version);
+
+        let tap_sighash = SighashCache::new(&proof_psbt.unsigned_tx)
+            .taproot_script_spend_signature_hash(i, &prevouts, leaf_hash, TapSighashType::Default)
+            .map_err(Error::crypto)
+            .with_context(|| format!("failed to compute sighash for proof of funds input {i}"))?;
+
+        let msg = secp256k1::Message::from_digest(tap_sighash.to_raw_hash().to_byte_array());
+
+        let (sig, pk) = match input.is_onchain {
+            true => sign_for_onchain_fn(proof_input, msg)?,
+            false => sign_for_vtxo_fn(proof_input, msg)?,
+        };
+
+        let sig = taproot::Signature {
+            signature: sig,
+            sighash_type: TapSighashType::Default,
+        };
+
+        proof_input.tap_script_sigs = BTreeMap::from_iter([((pk, leaf_hash), sig)]);
+    }
+
+    Ok(GetPendingTxIntent {
+        proof: proof_psbt,
+        message: get_pending_tx_message,
+    })
+}
+
+/// An intent proof for retrieving pending offchain transactions.
+#[derive(Debug, Clone)]
+pub struct GetPendingTxIntent {
+    pub proof: Psbt,
+    pub message: GetPendingTxMessage,
+}
+
+impl GetPendingTxIntent {
+    pub fn serialize_proof(&self) -> String {
+        let base64 = base64::engine::GeneralPurpose::new(
+            &base64::alphabet::STANDARD,
+            base64::engine::GeneralPurposeConfig::new(),
+        );
+
+        let bytes = self.proof.serialize();
+
+        base64.encode(&bytes)
+    }
+
+    pub fn serialize_message(&self) -> Result<String, Error> {
+        self.message.encode()
+    }
+}
+
+fn build_get_pending_tx_proof_psbt(
+    message: &GetPendingTxMessage,
+    inputs: &[Input],
+) -> Result<(Psbt, Input), Error> {
+    if inputs.is_empty() {
+        return Err(Error::ad_hoc("missing inputs"));
+    }
+
+    let message = message
+        .encode()
+        .map_err(Error::ad_hoc)
+        .context("failed to encode get-pending-tx message")?;
+
+    let first_input = inputs[0].clone();
+    let script_pubkey = first_input.witness_utxo.script_pubkey.clone();
+
+    let to_spend_tx = {
+        let hash = message_hash(message.as_bytes());
+
+        let script_sig = ScriptBuf::builder()
+            .push_opcode(OP_PUSHBYTES_0)
+            .push_slice(hash.as_byte_array())
+            .into_script();
+
+        let output = TxOut {
+            value: Amount::ZERO,
+            script_pubkey,
+        };
+
+        Transaction {
+            version: Version::non_standard(0),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0xFFFFFFFF,
+                },
+                script_sig,
+                sequence: Sequence::ZERO,
+                witness: Witness::default(),
+            }],
+            output: vec![output],
+        }
+    };
+
+    let fake_outpoint = OutPoint {
+        txid: to_spend_tx.compute_txid(),
+        vout: 0,
+    };
+
+    let to_sign_psbt = {
+        let mut to_sign_inputs = Vec::with_capacity(inputs.len() + 1);
+
+        to_sign_inputs.push(TxIn {
+            previous_output: fake_outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: first_input.sequence,
+            witness: Witness::default(),
+        });
+
+        for input in inputs.iter() {
+            to_sign_inputs.push(TxIn {
+                previous_output: input.outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: input.sequence,
+                witness: Witness::default(),
+            });
+        }
+
+        // For get-pending-tx, we use an OP_RETURN output since we're not registering anything.
+        let outputs = vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return([]),
+        }];
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: to_sign_inputs,
+            output: outputs,
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx)
+            .map_err(Error::ad_hoc)
+            .context("failed to build proof of funds PSBT")?;
+
+        psbt.inputs[0].witness_utxo = Some(to_spend_tx.output[0].clone());
+        psbt.inputs[0].sighash_type = Some(PsbtSighashType::from_u32(1));
+
+        for (i, input) in inputs.iter().enumerate() {
+            psbt.inputs[i + 1].witness_utxo = Some(input.witness_utxo.clone());
+            psbt.inputs[i + 1].sighash_type = Some(PsbtSighashType::from_u32(1));
+        }
+
+        psbt
+    };
+
+    let mut first_input_modified = first_input;
+    first_input_modified.outpoint = fake_outpoint;
+
+    Ok((to_sign_psbt, first_input_modified))
 }
 
 pub(crate) mod taptree {

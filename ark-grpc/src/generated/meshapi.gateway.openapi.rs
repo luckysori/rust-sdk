@@ -518,11 +518,11 @@ pub mod link {
         /// OpenAPI definition.
         #[prost(string, tag = "2")]
         OperationRef(::prost::alloc::string::String),
-        /// The name of an existing, resolvable OAS operation, as defined with a unique
-        /// operationId. This field is mutually exclusive of the operationRef field.
+        /// The name of an existing, resolvable OAS operation, as defined with a unique operationId.
+        /// This field is mutually exclusive of the operationRef field.
         ///
-        /// NOTE: If a path (relative or absolute) to another service method is used, that
-        /// operation ID will be substituted. Example: ".google.protobuf.Timestamp"
+        /// NOTE: If a path (relative or absolute) to another service method is used, that operation
+        /// ID will be substituted. Example: ".google.protobuf.Timestamp"
         #[prost(string, tag = "3")]
         OperationId(::prost::alloc::string::String),
     }

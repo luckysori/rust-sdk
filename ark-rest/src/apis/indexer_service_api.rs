@@ -134,10 +134,10 @@ pub async fn indexer_service_get_batch_sweep_transactions(
     let p_batch_outpoint_period_vout = batch_outpoint_period_vout;
 
     let uri_str = format!(
-        "{}/v1/indexer/batch/{batch_outpoint_txid}/{batch_outpoint_vout}/sweepTxs",
+        "{}/v1/indexer/batch/{}/{}/sweepTxs",
         configuration.base_path,
-        batch_outpoint_txid = crate::apis::urlencode(p_batch_outpoint_period_txid),
-        batch_outpoint_vout = p_batch_outpoint_period_vout
+        crate::apis::urlencode(p_batch_outpoint_period_txid),
+        p_batch_outpoint_period_vout
     );
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 
@@ -388,9 +388,9 @@ pub async fn indexer_service_get_subscription(
     let p_subscription_id = subscription_id;
 
     let uri_str = format!(
-        "{}/v1/indexer/script/subscription/{subscription_id}",
+        "{}/v1/indexer/script/subscription/{}",
         configuration.base_path,
-        subscription_id = crate::apis::urlencode(p_subscription_id)
+        crate::apis::urlencode(p_subscription_id)
     );
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 
@@ -520,10 +520,10 @@ pub async fn indexer_service_get_vtxo_chain(
     let p_page_period_index = page_period_index;
 
     let uri_str = format!(
-        "{}/v1/indexer/vtxo/{outpoint_txid}/{outpoint_vout}/chain",
+        "{}/v1/indexer/vtxo/{}/{}/chain",
         configuration.base_path,
-        outpoint_txid = crate::apis::urlencode(p_outpoint_period_txid),
-        outpoint_vout = p_outpoint_period_vout
+        crate::apis::urlencode(p_outpoint_period_txid),
+        p_outpoint_period_vout
     );
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 
@@ -591,10 +591,10 @@ pub async fn indexer_service_get_vtxo_tree(
     let p_page_period_index = page_period_index;
 
     let uri_str = format!(
-        "{}/v1/indexer/batch/{batch_outpoint_txid}/{batch_outpoint_vout}/tree",
+        "{}/v1/indexer/batch/{}/{}/tree",
         configuration.base_path,
-        batch_outpoint_txid = crate::apis::urlencode(p_batch_outpoint_period_txid),
-        batch_outpoint_vout = p_batch_outpoint_period_vout
+        crate::apis::urlencode(p_batch_outpoint_period_txid),
+        p_batch_outpoint_period_vout
     );
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 
@@ -661,10 +661,10 @@ pub async fn indexer_service_get_vtxo_tree_leaves(
     let p_page_period_index = page_period_index;
 
     let uri_str = format!(
-        "{}/v1/indexer/batch/{batch_outpoint_txid}/{batch_outpoint_vout}/tree/leaves",
+        "{}/v1/indexer/batch/{}/{}/tree/leaves",
         configuration.base_path,
-        batch_outpoint_txid = crate::apis::urlencode(p_batch_outpoint_period_txid),
-        batch_outpoint_vout = p_batch_outpoint_period_vout
+        crate::apis::urlencode(p_batch_outpoint_period_txid),
+        p_batch_outpoint_period_vout
     );
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 

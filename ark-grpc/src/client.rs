@@ -3,6 +3,7 @@ use crate::generated;
 use crate::generated::ark::v1::ConfirmRegistrationRequest;
 use crate::generated::ark::v1::GetEventStreamRequest;
 use crate::generated::ark::v1::GetInfoRequest;
+use crate::generated::ark::v1::GetPendingTxRequest;
 use crate::generated::ark::v1::GetSubscriptionRequest;
 use crate::generated::ark::v1::GetTransactionsStreamRequest;
 use crate::generated::ark::v1::IndexerChainedTxType;
@@ -15,6 +16,7 @@ use crate::generated::ark::v1::SubmitTreeSignaturesRequest;
 use crate::generated::ark::v1::SubscribeForScriptsRequest;
 use crate::generated::ark::v1::UnsubscribeForScriptsRequest;
 use crate::generated::ark::v1::ark_service_client::ArkServiceClient;
+use crate::generated::ark::v1::get_pending_tx_request;
 use crate::generated::ark::v1::get_subscription_response;
 use crate::generated::ark::v1::indexer_service_client::IndexerServiceClient;
 use crate::generated::ark::v1::indexer_tx_history_record::Key;
@@ -38,6 +40,7 @@ use ark_core::server::Info;
 use ark_core::server::ListVtxo;
 use ark_core::server::NoncePks;
 use ark_core::server::PartialSigTree;
+use ark_core::server::PendingOffchainTx;
 use ark_core::server::StreamEvent;
 use ark_core::server::StreamTransactionData;
 use ark_core::server::SubmitOffchainTxResponse;
@@ -231,6 +234,57 @@ impl Client {
             signed_ark_tx,
             signed_checkpoint_txs,
         })
+    }
+
+    /// Retrieve pending offchain transactions for the given intent.
+    pub async fn get_pending_tx(
+        &self,
+        intent: ark_core::intent::GetPendingTxIntent,
+    ) -> Result<Vec<PendingOffchainTx>, Error> {
+        let mut client = self.ark_client()?;
+
+        let intent: Intent = intent.try_into()?;
+
+        let res = client
+            .get_pending_tx(GetPendingTxRequest {
+                identifier: Some(get_pending_tx_request::Identifier::Intent(intent)),
+            })
+            .await
+            .map_err(Error::request)?;
+
+        let base64 = base64::engine::GeneralPurpose::new(
+            &base64::alphabet::STANDARD,
+            base64::engine::GeneralPurposeConfig::new(),
+        );
+
+        let pending_txs = res
+            .into_inner()
+            .pending_txs
+            .into_iter()
+            .map(|tx| {
+                let ark_txid = tx.ark_txid.parse().map_err(Error::conversion)?;
+                let signed_ark_tx = base64.decode(&tx.final_ark_tx).map_err(Error::conversion)?;
+                let signed_ark_tx = Psbt::deserialize(&signed_ark_tx).map_err(Error::conversion)?;
+
+                let signed_checkpoint_txs = tx
+                    .signed_checkpoint_txs
+                    .into_iter()
+                    .map(|tx| {
+                        let tx = base64.decode(tx).map_err(Error::conversion)?;
+                        let tx = Psbt::deserialize(&tx).map_err(Error::conversion)?;
+                        Ok(tx)
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+
+                Ok(PendingOffchainTx {
+                    ark_txid,
+                    signed_ark_tx,
+                    signed_checkpoint_txs,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(pending_txs)
     }
 
     pub async fn finalize_offchain_transaction(
@@ -568,6 +622,17 @@ impl TryFrom<ark_core::intent::Intent> for Intent {
     type Error = Error;
 
     fn try_from(value: ark_core::intent::Intent) -> Result<Self, Self::Error> {
+        Ok(Self {
+            proof: value.serialize_proof(),
+            message: value.serialize_message().map_err(Error::conversion)?,
+        })
+    }
+}
+
+impl TryFrom<ark_core::intent::GetPendingTxIntent> for Intent {
+    type Error = Error;
+
+    fn try_from(value: ark_core::intent::GetPendingTxIntent) -> Result<Self, Self::Error> {
         Ok(Self {
             proof: value.serialize_proof(),
             message: value.serialize_message().map_err(Error::conversion)?,
